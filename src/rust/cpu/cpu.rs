@@ -4560,6 +4560,11 @@ pub unsafe fn cycle_internal() {
         if *in_hlt {
             return;
         }
+        // the check that stop_jit_chaining asked for is done: compiled code may chain again
+        // for the rest of this do_many_cycles_native. Without this, one sti or popf that
+        // enables interrupts (every kernel entry has one) turns chaining off for up to
+        // LOOP_COUNTER instructions
+        jit_chain_instruction_limit = jit_chain_slice_end;
     }
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
@@ -5057,11 +5062,15 @@ pub unsafe fn main_loop() -> f64 {
 /// Compiled 64-bit code may continue directly with the next module (instead of returning to
 /// cycle_internal) while the instruction counter is below this value
 pub static mut jit_chain_instruction_limit: u32 = 0;
+/// The value of jit_chain_instruction_limit for the current do_many_cycles_native, restored
+/// once a deferred interrupt check (stop_jit_chaining) has been carried out
+static mut jit_chain_slice_end: u32 = 0;
 
 pub unsafe fn do_many_cycles_native() {
     profiler::stat_increment(stat::DO_MANY_CYCLES);
     let initial_instruction_counter = *instruction_counter;
-    jit_chain_instruction_limit = initial_instruction_counter.wrapping_add(LOOP_COUNTER as u32);
+    jit_chain_slice_end = initial_instruction_counter.wrapping_add(LOOP_COUNTER as u32);
+    jit_chain_instruction_limit = jit_chain_slice_end;
     in_cpu_execution = true;
     while (*instruction_counter).wrapping_sub(initial_instruction_counter) < LOOP_COUNTER as u32
         && !*in_hlt
