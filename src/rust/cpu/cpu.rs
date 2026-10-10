@@ -4964,6 +4964,13 @@ pub fn update_state_flags() {
 
 #[no_mangle]
 pub unsafe fn has_flat_segmentation() -> bool {
+    if *is_64 {
+        // in 64-bit mode the cs/ds/es/ss bases are zero and a null ds is usable, so the state
+        // must not depend on the selector the current thread happens to have in ds: Linux
+        // keeps it per thread, and code compiled for one value would run interpreted for
+        // every thread that has the other
+        return true;
+    }
     // cs/ss can't be null
     return *segment_offsets.offset(SS as isize) == 0
         && !*segment_is_null.offset(DS as isize)
