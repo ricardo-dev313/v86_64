@@ -585,6 +585,9 @@ pub unsafe fn tlb_invalidate_page(address: u64) {
 // silently survive flush/invalidate
 pub static mut valid_tlb_entries: [u64; 10000] = [0; 10000];
 pub static mut valid_tlb_entries_count: i32 = 0;
+/// The first valid_tlb_global_count entries of valid_tlb_entries were global when they were
+/// inserted: clear_tlb leaves them alone
+pub static mut valid_tlb_global_count: i32 = 0;
 
 pub static mut in_jit: bool = false;
 
@@ -3313,7 +3316,11 @@ pub unsafe fn do_page_walk(
         }
     }
 
-    if side_effects && tlb_pick_entry(addr) == 0 {
+    let tlb_global = global && 0 != cr4 & CR4_PGE;
+    let old_entry = if side_effects { tlb_pick_entry(addr) } else { 0 };
+    // an entry that is replaced in place is already in valid_tlb_entries, but a global one is
+    // in the prefix that clear_tlb skips: list it again if it stops being global
+    if side_effects && (old_entry == 0 || old_entry as i32 & TLB_GLOBAL != 0 && !tlb_global) {
         if valid_tlb_entries_count == VALID_TLB_ENTRY_MAX {
             profiler::stat_increment(stat::TLB_FULL);
             clear_tlb();
@@ -3324,7 +3331,17 @@ pub unsafe fn do_page_walk(
             }
         }
         dbg_assert!(valid_tlb_entries_count < VALID_TLB_ENTRY_MAX);
-        valid_tlb_entries[valid_tlb_entries_count as usize] = page;
+        if tlb_global {
+            // global entries are kept at the front, so that clear_tlb (every cr3 write)
+            // only walks the entries it has to remove
+            let g = valid_tlb_global_count as usize;
+            valid_tlb_entries[valid_tlb_entries_count as usize] = valid_tlb_entries[g];
+            valid_tlb_entries[g] = page;
+            valid_tlb_global_count += 1;
+        }
+        else {
+            valid_tlb_entries[valid_tlb_entries_count as usize] = page;
+        }
         valid_tlb_entries_count += 1;
         // TODO: Check that there are no duplicates in valid_tlb_entries
         // XXX: There will probably be duplicates due to invlpg deleting
@@ -3346,7 +3363,7 @@ pub unsafe fn do_page_walk(
         | if for_writing { 0 } else { TLB_READONLY }
         | if allow_user { 0 } else { TLB_NO_USER }
         | if is_in_mapped_range { TLB_IN_MAPPED_RANGE } else { 0 }
-        | if global && 0 != cr4 & CR4_PGE { TLB_GLOBAL } else { 0 }
+        | if tlb_global { TLB_GLOBAL } else { 0 }
         | if has_code { TLB_HAS_CODE } else { 0 }
         | if nx_enabled && !allow_fetch { TLB_NOT_EXECUTABLE } else { 0 };
 
@@ -3382,6 +3399,7 @@ pub unsafe fn full_clear_tlb() {
         }
     }
     valid_tlb_entries_count = 0;
+    valid_tlb_global_count = 0;
 
     if CHECK_TLB_INVARIANTS {
         #[allow(static_mut_refs)]
@@ -3396,8 +3414,10 @@ pub unsafe fn clear_tlb() {
     profiler::stat_increment(stat::CLEAR_TLB);
     // clear tlb excluding global pages
     *last_virt_eip64 = -1;
-    let mut global_page_offset = 0;
-    for i in 0..valid_tlb_entries_count {
+    // the entries in front of valid_tlb_global_count are global (or stale): only the rest is
+    // walked. An entry behind it can have become global since it was listed
+    let mut global_page_offset = valid_tlb_global_count;
+    for i in valid_tlb_global_count..valid_tlb_entries_count {
         let page = valid_tlb_entries[i as usize] as u64;
         // only the flag bits, which live in the low half of the entry
         let entry = if page < 0x10_0000 {
@@ -3429,6 +3449,7 @@ pub unsafe fn clear_tlb() {
         }
     }
     valid_tlb_entries_count = global_page_offset;
+    valid_tlb_global_count = global_page_offset;
 
     if CHECK_TLB_INVARIANTS {
         #[allow(static_mut_refs)]
