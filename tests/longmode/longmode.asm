@@ -347,7 +347,7 @@ after_nx:
     add rsp, 8                         ; discard the fake return address
     mov [r15 + 51*8], rax              ; 0xDEAD
 
-    ; ======== test 142-150: pop m64 restart after #PF, xchg r8/rax operand sizes ========
+    ; ======== test 142-154: pop m64 restart after #PF, xchg r8/rax operand sizes, sidt/sgdt ========
     jmp t142_far                     ; out of line: no room left before 0x1F00
 t142_back:
 
@@ -1713,6 +1713,26 @@ t142_far:
     mov rax, 0x1111111122223333
     db 0x66, 0x90                    ; without REX.B it stays a nop
     mov [r15 + 150*8], rax           ; 0x1111111122223333
+
+    ; test 151-154: sidt/sgdt store 10 bytes, the limit first and then the base
+    sub rsp, 16
+    mov rax, 0xAAAAAAAAAAAAAAAA
+    mov [rsp], rax
+    mov [rsp + 8], rax
+    sidt [rsp]
+    mov rax, [rsp]
+    mov [r15 + 151*8], rax           ; 0x600000FF (base 0x6000, limit 0xFF)
+    mov rax, [rsp + 8]
+    mov [r15 + 152*8], rax           ; 0xAAAAAAAAAAAA0000
+    mov rax, 0xAAAAAAAAAAAAAAAA
+    mov [rsp], rax
+    mov [rsp + 8], rax
+    sgdt [rsp]
+    mov rax, [rsp]
+    mov [r15 + 153*8], rax           ; 0x08000017 (base 0x800, limit 0x17)
+    mov rax, [rsp + 8]
+    mov [r15 + 154*8], rax           ; 0xAAAAAAAAAAAA0000
+    add rsp, 16
     jmp t142_back
 
     ; #PF handler part of test 142: PD2[1] -> 2MiB page @phys 0xA00000 (PD2

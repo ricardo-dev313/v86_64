@@ -79,13 +79,14 @@ pub unsafe fn instr64_0F00_5_mem(addr: u64) {
 }
 pub unsafe fn instr64_0F00_5_reg(r: i32) { crate::cpu::instructions_0f::instr16_0F00_5_reg(r) }
 pub unsafe fn instr64_0F01_0_mem(addr: u64) {
-    // sgdt: 10-byte pseudo descriptor in 64-bit mode (8-byte offset, 2-byte limit)
+    // sgdt: 10-byte pseudo descriptor in 64-bit mode (2-byte limit, then the 8-byte offset)
     if 0 != *cpl {
         trigger_gp(0);
         return;
     }
-    return_on_pagefault!(safe_write64(addr, *gdtr_offset64));
-    return_on_pagefault!(safe_write16(addr + 8, *gdtr_size));
+    return_on_pagefault!(writable_or_pagefault(addr, 10));
+    safe_write16(addr, *gdtr_size).unwrap();
+    safe_write64(addr + 2, *gdtr_offset64).unwrap();
 }
 pub unsafe fn instr64_0F01_0_reg(_a0: i32) { trigger_ud(); }
 pub unsafe fn instr64_0F01_1_mem(addr: u64) {
@@ -94,8 +95,9 @@ pub unsafe fn instr64_0F01_1_mem(addr: u64) {
         trigger_gp(0);
         return;
     }
-    return_on_pagefault!(safe_write64(addr, *idtr_offset64));
-    return_on_pagefault!(safe_write16(addr + 8, *idtr_size));
+    return_on_pagefault!(writable_or_pagefault(addr, 10));
+    safe_write16(addr, *idtr_size).unwrap();
+    safe_write64(addr + 2, *idtr_offset64).unwrap();
 }
 pub unsafe fn instr64_0F01_1_reg(_a0: i32) { trigger_ud(); }
 pub unsafe fn instr64_0F01_2_mem(addr: u64) {

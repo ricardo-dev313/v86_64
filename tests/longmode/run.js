@@ -183,6 +183,10 @@ const expected = [
     0x111111112222DDDDn, // 148: xchg r8w, ax (66 41 90): rax
     0xBBBBBBBBCCCC3333n, // 149: xchg r8w, ax (66 41 90): r8
     0x1111111122223333n, // 150: 66 90 is a nop
+    0x00000000600000FFn, // 151: sidt: limit, then the low 6 bytes of the base
+    0xAAAAAAAAAAAA0000n, // 152: sidt: the high 2 bytes of the base, nothing behind them
+    0x0000000008000017n, // 153: sgdt: limit, then the low 6 bytes of the base
+    0xAAAAAAAAAAAA0000n, // 154: sgdt: the high 2 bytes of the base, nothing behind them
 ];
 
 const emulator = new V86({
