@@ -933,6 +933,21 @@ V86.prototype.restore_state = async function(state)
 };
 
 /**
+ * Restore a state that arrives in chunks, for instance the body of a `fetch`
+ * response: `await emulator.restore_state_stream(response.body)`. The state
+ * (zstd-compressed or not) is never held as a whole and guest pages that are
+ * zero are not touched, which keeps the memory use of a restore close to the
+ * memory the guest actually uses. The emulator must be stopped.
+ *
+ * @param {!Object} chunks An async iterable of Uint8Array
+ * @param {function(number)=} on_progress Called with the number of bytes consumed so far
+ */
+V86.prototype.restore_state_stream = async function(chunks, on_progress)
+{
+    await this.v86.restore_state_stream(chunks, on_progress);
+};
+
+/**
  * Asynchronously save the current state of the emulator.
  *
  * @return {Promise<ArrayBuffer>}

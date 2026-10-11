@@ -1,5 +1,5 @@
 import { CPU } from "./cpu.js";
-import { save_state, restore_state } from "./state.js";
+import { save_state, restore_state, restore_state_stream } from "./state.js";
 export { V86 } from "./browser/starter.js";
 
 /**
@@ -215,6 +215,11 @@ v86.prototype.restore_state = function(state)
 {
     // TODO: Should be implemented here, not on cpu
     return restore_state(this.cpu, state);
+};
+
+v86.prototype.restore_state_stream = function(chunks, on_progress)
+{
+    return restore_state_stream(this.cpu, chunks, on_progress);
 };
 
 /* global require */

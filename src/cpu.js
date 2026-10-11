@@ -515,6 +515,14 @@ CPU.prototype.wasm_patch = function()
     this.zstd_free_ctx = get_import("zstd_free_ctx");
     this.zstd_read = get_import("zstd_read");
     this.zstd_read_free = get_import("zstd_read_free");
+    this.zstd_stream_create = get_import("zstd_stream_create");
+    this.zstd_stream_free = get_import("zstd_stream_free");
+    this.zstd_stream_buffer_size = get_import("zstd_stream_buffer_size");
+    this.zstd_stream_src_ptr = get_import("zstd_stream_src_ptr");
+    this.zstd_stream_dst_ptr = get_import("zstd_stream_dst_ptr");
+    this.zstd_stream_set_input = get_import("zstd_stream_set_input");
+    this.zstd_stream_input_left = get_import("zstd_stream_input_left");
+    this.zstd_stream_decompress = get_import("zstd_stream_decompress");
 };
 
 CPU.prototype.jit_force_generate = function(addr)
@@ -654,6 +662,9 @@ CPU.prototype.get_state = function()
     state[75] = this.fpu_opcode[0];
 
     const { packed_memory, bitmap } = this.pack_memory();
+    // the bitmap is also stored before the pages, so that restore_state_stream can place them
+    // as they arrive (78 is what older versions read)
+    state[76] = new Uint8Array(bitmap.get_buffer());
     state[77] = packed_memory;
     state[78] = new Uint8Array(bitmap.get_buffer());
 
@@ -890,9 +901,13 @@ CPU.prototype.set_state = function(state)
     if(state[87] !== undefined) this.fpu_status_word = state[87];
     if(state[88] !== undefined) this.mxcsr = state[88];
 
-    const bitmap = new Bitmap(state[78].buffer);
-    const packed_memory = state[77];
-    this.unpack_memory(bitmap, packed_memory);
+    // restore_state_stream has placed the pages already and passes no packed memory
+    if(state[77])
+    {
+        const bitmap = new Bitmap(state[78].buffer);
+        const packed_memory = state[77];
+        this.unpack_memory(bitmap, packed_memory);
+    }
 
     if(state[99])
     {
@@ -1045,8 +1060,6 @@ CPU.prototype.pack_memory = function()
 
 CPU.prototype.unpack_memory = function(bitmap, packed_memory)
 {
-    this.zero_memory(0, this.memory_size[0]);
-
     const page_count = this.memory_size[0] / 0x1000;
     let packed_page = 0;
 
@@ -1059,6 +1072,20 @@ CPU.prototype.unpack_memory = function(bitmap, packed_memory)
             this.mem8.set(view, page * 0x1000);
             packed_page++;
         }
+        else
+        {
+            this.zero_page_if_needed(page);
+        }
+    }
+};
+
+// Zeroing a page that is zero already would still make the host commit it: in a state image
+// most of a guest's memory is zero pages, and a fresh instance hasn't touched them yet
+CPU.prototype.zero_page_if_needed = function(page)
+{
+    if(!this.is_memory_zeroed(page * 0x1000, 0x1000))
+    {
+        this.zero_memory(page * 0x1000, 0x1000);
     }
 };
 

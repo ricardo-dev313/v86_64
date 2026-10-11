@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // A state image saved in long mode restores the registers that only exist with their full
 // width there: star/lstar/cstar/sfmask, the fs/gs/kernel gs bases, cr2, the idtr and gdtr bases
-// and the pending lazy flags of a 64-bit operation (see state.asm).
+// and the pending lazy flags of a 64-bit operation (see state.asm). It is restored three ways:
+// from a buffer at start, and from a stream of chunks, plain and zstd-compressed.
 // Same knobs as run.js: DISABLE_JIT, V86_WASM_PATH, TEST_RELEASE_BUILD.
 
 import url from "node:url";
 import path from "node:path";
+import zlib from "node:zlib";
 import { execFileSync } from "node:child_process";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
@@ -80,13 +82,42 @@ const before = read_qwords(first, BEFORE);
 const state = await first.save_state();
 await first.destroy();
 
-const second = new V86({ ...config, initial_state: { buffer: state } });
-const finished = wait_for_byte(second, 0x4B); // 'K'
-await new Promise(resolve => second.add_listener("emulator-started", resolve));
-second.write_memory(new Uint8Array([1]), FLAG);
-await finished;
-const after = read_qwords(second, RESULTS);
-await second.destroy();
+// the three ways to restore: the whole buffer at start, and a stream of chunks into a stopped
+// emulator, plain or zstd-compressed
+async function* in_chunks(buffer)
+{
+    for(let offset = 0; offset < buffer.length; offset += 100000)
+    {
+        yield buffer.subarray(offset, offset + 100000);
+    }
+}
+
+async function restored(kind)
+{
+    let emulator;
+    if(kind === "buffer")
+    {
+        emulator = new V86({ ...config, initial_state: { buffer: state } });
+        await new Promise(resolve => emulator.add_listener("emulator-started", resolve));
+    }
+    else
+    {
+        emulator = new V86({ ...config, autostart: false });
+        await new Promise(resolve => emulator.add_listener("emulator-loaded", resolve));
+        const bytes = new Uint8Array(state);
+        await emulator.restore_state_stream(in_chunks(kind === "zstd stream" ? zlib.zstdCompressSync(bytes) : bytes));
+    }
+    const finished = wait_for_byte(emulator, 0x4B); // 'K'
+    if(kind !== "buffer")
+    {
+        emulator.run();
+    }
+    emulator.write_memory(new Uint8Array([1]), FLAG);
+    await finished;
+    const after = read_qwords(emulator, RESULTS);
+    await emulator.destroy();
+    return after;
+}
 
 let failed = false;
 for(let i = 0; i < expected.length; i++)
@@ -97,10 +128,22 @@ for(let i = 0; i < expected.length; i++)
         console.log(`[-] ${expected[i][1]} before saving: expected 0x${expected[i][0].toString(16)}, got 0x${before[i].toString(16)}`);
         failed = true;
     }
-    if(after[i] !== expected[i][0])
+}
+for(const kind of ["buffer", "stream", "zstd stream"])
+{
+    if(kind === "zstd stream" && !zlib.zstdCompressSync)
     {
-        console.log(`[-] ${expected[i][1]} after restoring: expected 0x${expected[i][0].toString(16)}, got 0x${after[i].toString(16)}`);
-        failed = true;
+        console.log("no zstd in this node, compressed stream not tested");
+        continue;
+    }
+    const after = await restored(kind);
+    for(let i = 0; i < expected.length; i++)
+    {
+        if(after[i] !== expected[i][0])
+        {
+            console.log(`[-] ${expected[i][1]} after restoring (${kind}): expected 0x${expected[i][0].toString(16)}, got 0x${after[i].toString(16)}`);
+            failed = true;
+        }
     }
 }
 if(failed)
