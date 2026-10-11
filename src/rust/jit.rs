@@ -93,6 +93,14 @@ pub const BRTABLE_CUTOFF: usize = 10;
 // needs to be synced to const.js
 pub const WASM_TABLE_SIZE: u32 = 900;
 
+/// The number of compiled modules that may exist at a time (at most WASM_TABLE_SIZE - 1);
+/// set_jit_config(11, n). See jit_evict_modules.
+static mut JIT_MAX_MODULES: u32 = WASM_TABLE_SIZE;
+/// Set to non-zero for a module each time it's entered: by cycle_internal, and by the module
+/// itself when it's for 64-bit code (which can be entered from another module)
+pub static mut MODULE_USED: [u8; WASM_TABLE_SIZE as usize] = [0; WASM_TABLE_SIZE as usize];
+static mut JIT_EVICTION_HAND: u32 = 0;
+
 pub const CHECK_JIT_STATE_INVARIANTS: bool = false;
 
 const MAX_INSTRUCTION_LENGTH: u32 = 16;
@@ -1052,19 +1060,17 @@ fn jit_analyze_and_generate(
         }
     }
 
-    if ctx.wasm_table_index_free_list.is_empty() {
-        dbg_log!("wasm_table_index_free_list empty, clearing cache");
-
-        // When no free slots are available, delete all cached modules. We could increase the
-        // size of the table, but this way the initial size acts as an upper bound for the
-        // number of wasm modules that we generate, which we want anyway to avoid getting our
-        // tab killed by browsers due to memory constraints.
-        jit_clear_cache(ctx);
+    // The size of the table (or JIT_MAX_MODULES, if lower) is the upper bound for the number of
+    // wasm modules that exist at a time, which we want to avoid getting our tab killed by
+    // browsers due to memory constraints: a module costs the host several hundred kilobytes.
+    let modules_in_use = WASM_TABLE_SIZE - 1 - ctx.wasm_table_index_free_list.len() as u32;
+    if ctx.wasm_table_index_free_list.is_empty() || modules_in_use >= unsafe { JIT_MAX_MODULES } {
+        jit_evict_modules(ctx);
 
         profiler::stat_increment(stat::INVALIDATE_ALL_MODULES_NO_FREE_WASM_INDICES);
 
         dbg_log!(
-            "after jit_clear_cache: {} free",
+            "after jit_evict_modules: {} free",
             ctx.wasm_table_index_free_list.len(),
         );
 
@@ -1376,6 +1382,16 @@ fn jit_generate_module(
     else {
         None
     };
+
+    if state_flags.is_64() {
+        // mark the module as used (jit_evict_modules); only modules for 64-bit code, the
+        // others are always entered through cycle_internal and stay byte-identical
+        #[allow(static_mut_refs)]
+        let used = unsafe { MODULE_USED.as_ptr() } as u32 + wasm_table_index.to_u16() as u32;
+        builder.const_i32(used as i32);
+        builder.const_i32(1);
+        builder.store_u8(0);
+    }
 
     // with chaining, the exit code looks up the next entry point and continues here if it's
     // in this module (see jit64::gen_chain_to_next_module)
@@ -2473,6 +2489,63 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     jit_clear_func(wasm_table_index);
 }
 
+/// Make room in a full cache: free the modules that haven't run since the previous call, an
+/// eighth of the cache at least (the oldest table indices first when all of them have run).
+/// Deleting everything, which is simpler, sends the whole guest back to the interpreter until
+/// its code is hot again.
+fn jit_evict_modules(ctx: &mut JitState) {
+    let in_use_before = WASM_TABLE_SIZE - 1 - ctx.wasm_table_index_free_list.len() as u32;
+    let limit = unsafe { JIT_MAX_MODULES }.min(WASM_TABLE_SIZE - 1).max(8);
+    // down to 7/8 of the limit
+    let target = (in_use_before + limit / 8)
+        .saturating_sub(limit)
+        .max(limit / 8);
+
+    let mut pages_of_module: HashMap<WasmTableIndex, Vec<Page>> = HashMap::default();
+    for (&page, info) in &ctx.pages {
+        pages_of_module
+            .entry(info.wasm_table_index)
+            .or_insert_with(Vec::new)
+            .push(page);
+        for &hidden in &info.hidden_wasm_table_indices {
+            pages_of_module
+                .entry(hidden)
+                .or_insert_with(Vec::new)
+                .push(page);
+        }
+    }
+
+    let mut hand = unsafe { JIT_EVICTION_HAND };
+    // two rounds: the first one spares the modules that have run and clears their mark
+    for _ in 0..2 * (WASM_TABLE_SIZE - 1) {
+        let freed =
+            in_use_before - (WASM_TABLE_SIZE - 1 - ctx.wasm_table_index_free_list.len() as u32);
+        if freed >= target {
+            break;
+        }
+        hand = if hand + 1 >= WASM_TABLE_SIZE { 1 } else { hand + 1 };
+        let index = WasmTableIndex(hand as u16);
+        let pages = match pages_of_module.get(&index) {
+            Some(pages) => pages,
+            // free, being compiled, or freed along with another module in this call
+            None => continue,
+        };
+        if unsafe { MODULE_USED[hand as usize] } != 0 {
+            unsafe { MODULE_USED[hand as usize] = 0 };
+            continue;
+        }
+        for &page in pages {
+            jit_dirty_page_ctx(ctx, page);
+        }
+    }
+    unsafe { JIT_EVICTION_HAND = hand };
+
+    if ctx.wasm_table_index_free_list.is_empty() {
+        // nothing could be freed module by module
+        jit_clear_cache(ctx);
+    }
+}
+
 /// Register a write in this page: Delete all present code
 fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     let mut did_have_code = false;
@@ -2763,6 +2836,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         8 => crate::jit64::JIT64_DEFER_FLAGS = value != 0,
         9 => crate::jit64::JIT64_TLB_CACHE = value != 0,
         10 => crate::wasmgen::wasm_builder::BRANCH_HINTS = value != 0,
+        11 => JIT_MAX_MODULES = value,
         _ => dbg_assert!(false),
     }
 }
@@ -2780,6 +2854,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         8 => crate::jit64::JIT64_DEFER_FLAGS as u32,
         9 => crate::jit64::JIT64_TLB_CACHE as u32,
         10 => crate::wasmgen::wasm_builder::BRANCH_HINTS as u32,
+        11 => JIT_MAX_MODULES,
         _ => 0,
     }
 }

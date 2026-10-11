@@ -256,7 +256,8 @@ Nothing known hits these.
   threshold (`JIT_THRESHOLD`), `(7, 0)` disables chaining
   (`JIT64_CHAINING=0`), `(8, 0)` restores eager flag stores
   (`JIT64_DEFER_FLAGS=0`), `(9, 0)` disables the data TLB cache
-  (`JIT64_TLB_CACHE=0`), and `(10, 0)` omits the branch hint section.
+  (`JIT64_TLB_CACHE=0`), `(10, 0)` omits the branch hint section, and `(11, n)` keeps at most n
+  compiled modules (the least recently run ones are freed first).
   Setting `NATIVE64_SKIP=group,...` at generation time
   falls back to the interpreter for groups of native instructions, which
   helps when bisecting a miscompilation.

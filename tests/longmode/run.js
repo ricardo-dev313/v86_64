@@ -232,6 +232,15 @@ if(process.env.JIT64_TLB_CACHE === "0")
     });
 }
 
+// JIT_MAX_MODULES=<n>: keep at most n compiled modules (with JIT_THRESHOLD=1 the test compiles
+// more than a few, so that modules are evicted while it runs)
+if(process.env.JIT_MAX_MODULES)
+{
+    emulator.bus.register("emulator-started", () => {
+        emulator.v86.cpu.wm.exports["set_jit_config"](11, +process.env.JIT_MAX_MODULES);
+    });
+}
+
 const timeout = setTimeout(() => {
     throw new Error("Timeout waiting for longmode test to finish");
 }, 60 * 1000);

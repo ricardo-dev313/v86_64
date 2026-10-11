@@ -4654,6 +4654,7 @@ pub unsafe fn cycle_internal() {
             }
         }
         profiler::stat_increment(stat::RUN_FROM_CACHE);
+        jit::MODULE_USED[wasm_table_index as usize] = 1;
         let initial_instruction_counter = *instruction_counter;
         #[cfg(debug_assertions)]
         {

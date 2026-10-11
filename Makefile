@@ -390,6 +390,7 @@ longmode-tests: build/v86-debug.wasm
 	./tests/longmode/run.js
 	JIT_THRESHOLD=1 ./tests/longmode/run.js
 	JIT_THRESHOLD=1 JIT64_CHAINING=0 ./tests/longmode/run.js
+	JIT_THRESHOLD=1 JIT_MAX_MODULES=8 ./tests/longmode/run.js
 	./tests/longmode/multiboot64.js
 	./tests/longmode/selfipi.js
 	JIT64_CHAINING=0 ./tests/longmode/selfipi.js
