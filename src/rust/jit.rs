@@ -1380,6 +1380,10 @@ fn jit_generate_module(
             builder.block_end();
         }
         else {
+            // only for 64-bit code: modules for 16-bit and 32-bit code stay byte-identical
+            if state_flags.is_64() {
+                builder.hint_next_branch(false);
+            }
             builder.br_if(exit_label);
         }
     }
@@ -2078,6 +2082,9 @@ fn jit_generate_module(
                             ctx.builder.block_end();
                         }
                         else {
+                            if state_flags.is_64() {
+                                ctx.builder.hint_next_branch(false);
+                            }
                             ctx.builder.br_if(exit_label);
                         }
                     }
@@ -2741,6 +2748,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         7 => JIT64_CHAINING = value != 0,
         8 => crate::jit64::JIT64_DEFER_FLAGS = value != 0,
         9 => crate::jit64::JIT64_TLB_CACHE = value != 0,
+        10 => crate::wasmgen::wasm_builder::BRANCH_HINTS = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -2757,6 +2765,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         7 => JIT64_CHAINING as u32,
         8 => crate::jit64::JIT64_DEFER_FLAGS as u32,
         9 => crate::jit64::JIT64_TLB_CACHE as u32,
+        10 => crate::wasmgen::wasm_builder::BRANCH_HINTS as u32,
         _ => 0,
     }
 }

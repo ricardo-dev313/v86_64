@@ -88,6 +88,9 @@ pub const WASM_MODULE_ARGUMENT_COUNT: u8 = 1;
 /// Parameters of a module for 64-bit code: the initial state and the 16 registers
 pub const WASM_MODULE_ARGUMENT_COUNT_JIT64: u8 = 17;
 
+/// Whether modules get a branch hint section (see WasmBuilder::hint_next_branch)
+pub static mut BRANCH_HINTS: bool = true;
+
 pub struct WasmBuilder {
     output: Vec<u8>,
     instruction_body: Vec<u8>,
@@ -115,6 +118,10 @@ pub struct WasmBuilder {
     arg_count: u8,
     /// whether the module imports the function table (for return_call_indirect)
     import_function_table: bool,
+
+    /// (offset in instruction_body of an if/br_if, whether it's likely taken), in increasing
+    /// order of offsets: written as a metadata.code.branch_hint section
+    branch_hints: Vec<(u32, bool)>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -166,6 +173,7 @@ impl WasmBuilder {
             arg_local_initial_state: WasmLocal(0),
             arg_count: WASM_MODULE_ARGUMENT_COUNT,
             import_function_table: false,
+            branch_hints: Vec::new(),
         };
         b.init();
         b
@@ -198,6 +206,7 @@ impl WasmBuilder {
         self.local_count = 0;
         self.arg_count = WASM_MODULE_ARGUMENT_COUNT;
         self.import_function_table = false;
+        self.branch_hints.clear();
 
         dbg_assert!(self.label_to_depth.is_empty());
         dbg_assert!(self.label_stack.is_empty());
@@ -211,24 +220,6 @@ impl WasmBuilder {
         self.write_memory_import();
         self.write_function_section();
         self.write_export_section();
-
-        // write code section preamble
-        self.output.push(op::SC_CODE);
-
-        let idx_code_section_size = self.output.len(); // we will write to this location later
-        self.output.push(0);
-        self.output.push(0); // write temp val for now using 4 bytes
-        self.output.push(0);
-        self.output.push(0);
-
-        self.output.push(1); // number of function bodies: just 1
-
-        // same as above but for body size of the function
-        let idx_fn_body_size = self.output.len();
-        self.output.push(0);
-        self.output.push(0);
-        self.output.push(0);
-        self.output.push(0);
 
         dbg_assert!(
             self.local_count as usize == self.free_locals_i32.len() + self.free_locals_i64.len(),
@@ -260,6 +251,28 @@ impl WasmBuilder {
             groups.push((local_type, 1));
         }
         dbg_assert!(groups.len() < 128);
+
+        // the hints must come before the code section
+        self.write_branch_hint_section(1 + 2 * groups.len() as u32);
+
+        // write code section preamble
+        self.output.push(op::SC_CODE);
+
+        let idx_code_section_size = self.output.len(); // we will write to this location later
+        self.output.push(0);
+        self.output.push(0); // write temp val for now using 4 bytes
+        self.output.push(0);
+        self.output.push(0);
+
+        self.output.push(1); // number of function bodies: just 1
+
+        // same as above but for body size of the function
+        let idx_fn_body_size = self.output.len();
+        self.output.push(0);
+        self.output.push(0);
+        self.output.push(0);
+        self.output.push(0);
+
         self.output.push(groups.len().safe_to_u8());
         for (local_type, count) in groups {
             dbg_assert!(count < 128);
@@ -640,6 +653,46 @@ impl WasmBuilder {
         self.set_import_table_size(new_table_size);
 
         self.import_count - 1
+    }
+
+    /// Mark the if or br_if generated next as likely (or unlikely) taken. Engines that implement
+    /// the branch hinting proposal keep the unlikely side out of the hot path; others ignore
+    /// the section. set_jit_config(10, 0) disables it.
+    pub fn hint_next_branch(&mut self, likely: bool) {
+        if !unsafe { BRANCH_HINTS } {
+            return;
+        }
+        let offset = self.instruction_body.len() as u32;
+        dbg_assert!(self.branch_hints.last().map_or(true, |&(o, _)| o < offset));
+        self.branch_hints.push((offset, likely));
+    }
+
+    /// The metadata.code.branch_hint custom section: the hints of the module's function, with
+    /// offsets relative to the start of its locals declaration (of locals_size bytes)
+    fn write_branch_hint_section(&mut self, locals_size: u32) {
+        if self.branch_hints.is_empty() {
+            return;
+        }
+        let mut payload = Vec::with_capacity(32 + 6 * self.branch_hints.len());
+        let name = "metadata.code.branch_hint";
+        payload.push(name.len() as u8);
+        payload.extend(name.as_bytes());
+        payload.push(1); // number of functions with hints
+        let non_function_imports =
+            self.memory_import_count + if self.import_function_table { 1 } else { 0 };
+        write_leb_u32(
+            &mut payload,
+            (self.import_count - non_function_imports) as u32,
+        );
+        write_leb_u32(&mut payload, self.branch_hints.len() as u32);
+        for &(offset, likely) in &self.branch_hints {
+            write_leb_u32(&mut payload, locals_size + offset);
+            payload.push(1); // size of the hint
+            payload.push(likely as u8);
+        }
+        self.output.push(op::SC_CUSTOM);
+        write_leb_u32(&mut self.output, payload.len() as u32);
+        self.output.append(&mut payload);
     }
 
     pub fn write_function_section(&mut self) {
@@ -1171,6 +1224,22 @@ impl WasmBuilder {
         self.instruction_body.push(op::OP_BRIF);
         self.write_label(label);
     }
+    pub fn br_if_likely(&mut self, label: Label) {
+        self.hint_next_branch(true);
+        self.br_if(label);
+    }
+    pub fn br_if_unlikely(&mut self, label: Label) {
+        self.hint_next_branch(false);
+        self.br_if(label);
+    }
+    pub fn if_void_likely(&mut self) {
+        self.hint_next_branch(true);
+        self.if_void();
+    }
+    pub fn if_void_unlikely(&mut self) {
+        self.hint_next_branch(false);
+        self.if_void();
+    }
 
     fn write_label(&mut self, label: Label) {
         let depth = *self.label_to_depth.get(&label).unwrap();
@@ -1316,5 +1385,51 @@ mod tests {
 
         let mut f = File::create("build/dummy_output.wasm").expect("creating dummy_output.wasm");
         f.write_all(&m.output).expect("write dummy_output.wasm");
+    }
+
+    #[test]
+    fn branch_hint_section() {
+        let name = b"metadata.code.branch_hint";
+        let find = |output: &Vec<u8>| output.windows(name.len()).position(|w| w == name);
+
+        let mut m = WasmBuilder::new();
+        m.call_fn("foo", FunctionType::FN0);
+        m.finish();
+        assert!(find(&m.output).is_none(), "no section without hints");
+        m.reset();
+
+        m.call_fn("foo", FunctionType::FN0);
+        let local = m.alloc_local();
+        m.const_i32(1);
+        m.tee_local(&local);
+        m.if_void_unlikely();
+        m.unreachable();
+        m.block_end();
+        let block = m.block_void();
+        m.get_local(&local);
+        m.br_if_likely(block);
+        m.block_end();
+        m.free_local(local);
+        m.finish();
+
+        let output = &m.output;
+        let name_at = find(output).expect("hint section");
+        // custom section: id, size, length of the name
+        assert_eq!(output[name_at - 3], super::op::SC_CUSTOM);
+        assert_eq!(output[name_at - 1] as usize, name.len());
+        let hints = &output[name_at + name.len()..];
+        // one function (index 1: after the imported foo) with two hints of one byte each
+        assert_eq!(hints[..3], [1, 1, 2]);
+        let (offset_if, offset_br_if) = (hints[3] as usize, hints[6] as usize);
+        assert_eq!(hints[4..6], [1, 0]);
+        assert_eq!(hints[7..9], [1, 1]);
+        assert_eq!(output[name_at - 2] as usize, 1 + name.len() + 9);
+        // followed by the code section: id, size, number of functions, size of the body
+        let code = &hints[9..];
+        assert_eq!(code[0], super::op::SC_CODE);
+        let body = &code[1 + 4 + 1 + 4..];
+        // the offsets are relative to the locals declaration
+        assert_eq!(body[offset_if], super::op::OP_IF);
+        assert_eq!(body[offset_br_if], super::op::OP_BRIF);
     }
 }

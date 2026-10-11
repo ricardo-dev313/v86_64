@@ -255,8 +255,9 @@ Nothing known hits these.
 - Switches: `set_jit_config(4, 1)` disables JIT64, `(5, n)` sets the hotness
   threshold (`JIT_THRESHOLD`), `(7, 0)` disables chaining
   (`JIT64_CHAINING=0`), `(8, 0)` restores eager flag stores
-  (`JIT64_DEFER_FLAGS=0`), and `(9, 0)` disables the data TLB cache
-  (`JIT64_TLB_CACHE=0`). Setting `NATIVE64_SKIP=group,...` at generation time
+  (`JIT64_DEFER_FLAGS=0`), `(9, 0)` disables the data TLB cache
+  (`JIT64_TLB_CACHE=0`), and `(10, 0)` omits the branch hint section.
+  Setting `NATIVE64_SKIP=group,...` at generation time
   falls back to the interpreter for groups of native instructions, which
   helps when bisecting a miscompilation.
 - While debug registers or TF are armed, the CPU runs interpreter-only.

@@ -9,6 +9,7 @@ macro_rules! c {
 c!(WASM_VERSION, 0x1);
 
 // Section codes
+c!(SC_CUSTOM, 0);
 c!(SC_TYPE, 1);
 c!(SC_IMPORT, 2);
 c!(SC_FUNCTION, 3);
