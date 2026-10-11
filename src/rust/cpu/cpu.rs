@@ -369,7 +369,15 @@ pub struct Code {
     pub wasm_table_index: jit::WasmTableIndex,
     pub state_flags: CachedStateFlags,
     pub state_table: [u16; 0x1000],
+    /// The offsets of state_table that hold an entry point when there are at most
+    /// CODE_MAX_TRACKED_ENTRIES of them (entry_count), so that a Code can be emptied without
+    /// writing the whole table. CODE_ENTRIES_UNTRACKED: the table has to be filled.
+    pub entry_count: u16,
+    pub entry_offsets: [u16; CODE_MAX_TRACKED_ENTRIES],
 }
+
+pub const CODE_MAX_TRACKED_ENTRIES: usize = 62;
+pub const CODE_ENTRIES_UNTRACKED: u16 = u16::MAX;
 
 /// Element type of tlb_data: i32 in the default build (host offsets are < 4 GiB), i64 in the
 /// mem64 build (host offsets into the 64-bit guest memory may exceed 32 bits above 4 GiB).
@@ -394,8 +402,8 @@ pub fn tlb_entry_to_u64(e: TlbEntry) -> u64 { e as u64 }
 /// traffic (they free one entry per compiled page).
 static mut code_free_list: Vec<ptr::NonNull<Code>> = Vec::new();
 
-/// Allocate a Code (zeroed; set_tlb_code initialises all fields). Chunks are allocated
-/// without dropping, so their addresses are stable for the lifetime of the emulator.
+/// Allocate a Code (set_tlb_code initialises all fields). Chunks are allocated without
+/// dropping, so their addresses are stable for the lifetime of the emulator.
 pub unsafe fn code_alloc() -> ptr::NonNull<Code> {
     #[allow(static_mut_refs)]
     if let Some(c) = code_free_list.pop() {
@@ -409,6 +417,8 @@ pub unsafe fn code_alloc() -> ptr::NonNull<Code> {
     dbg_assert!(!base.is_null());
     #[allow(static_mut_refs)]
     for i in (0..CHUNK).rev() {
+        // a new table is all zeroes, not all u16::MAX
+        (*base.add(i)).entry_count = CODE_ENTRIES_UNTRACKED;
         code_free_list.push(ptr::NonNull::new_unchecked(base.add(i)));
     }
     #[allow(static_mut_refs)]

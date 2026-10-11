@@ -1278,22 +1278,36 @@ pub fn set_tlb_code(
     };
     let c = match *slot {
         None => unsafe {
-            let mut c = cpu::code_alloc();
+            let c = cpu::code_alloc();
             *slot = Some(c);
-            let c = c.as_mut();
-            c.state_table.fill(u16::MAX);
-            c.state_flags = state_flags;
-            c.wasm_table_index = wasm_table_index;
-            c
+            &mut *c.as_ptr()
         },
-        Some(mut c) => unsafe {
-            let c = c.as_mut();
-            c.state_table.fill(u16::MAX);
-            c.state_flags = state_flags;
-            c.wasm_table_index = wasm_table_index;
-            c
-        },
+        Some(c) => unsafe { &mut *c.as_ptr() },
     };
+    c.state_flags = state_flags;
+    c.wasm_table_index = wasm_table_index;
+
+    // Empty the table. This runs for every code page that enters the tlb, that is for all the
+    // code a process touches after each change of address space: undo the entry points of
+    // the previous use instead of writing the whole table, when they were few enough to be
+    // remembered.
+    if c.entry_count == cpu::CODE_ENTRIES_UNTRACKED {
+        c.state_table.fill(u16::MAX);
+    }
+    else {
+        for i in 0..c.entry_count as usize {
+            c.state_table[c.entry_offsets[i] as usize] = u16::MAX;
+        }
+    }
+    if entries.len() <= cpu::CODE_MAX_TRACKED_ENTRIES {
+        c.entry_count = entries.len() as u16;
+        for (i, &(addr, _)) in entries.iter().enumerate() {
+            c.entry_offsets[i] = addr;
+        }
+    }
+    else {
+        c.entry_count = cpu::CODE_ENTRIES_UNTRACKED;
+    }
 
     for &(addr, state) in entries {
         dbg_assert!(state != u16::MAX);
