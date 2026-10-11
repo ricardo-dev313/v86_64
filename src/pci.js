@@ -252,10 +252,11 @@ PCI.prototype.set_state = function(state)
         for(var bar_nr = 0; bar_nr < device.pci_bars.length; bar_nr++)
         {
             var value = space[(0x10 >> 2) + bar_nr];
+            var bar = device.pci_bars[bar_nr];
 
-            if(value & 1)
+            // pci_bars can have holes (a device that only implements some of its bars)
+            if(value & 1 && bar)
             {
-                var bar = device.pci_bars[bar_nr];
                 var from = bar.original_bar & ~1 & 0xFFFF;
                 var to = value & ~1 & 0xFFFF;
                 this.set_io_bars(bar, from, to);

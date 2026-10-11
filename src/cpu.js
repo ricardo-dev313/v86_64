@@ -676,6 +676,12 @@ CPU.prototype.get_state = function()
     state[93] = this.pat;
     state[98] = this.devices.virtio_gpu;
 
+    // the 64-bit cpu state that has no slot above (see global_pointers.rs): lazy flag operands,
+    // star/lstar/cstar/sfmask, fs/gs/kernel gs base, cr2, the idtr and gdtr bases, sysenter
+    // esp/eip, misc_enable, the nmi flags and the high half of cr3; then the base of the tss
+    state[99] = new Uint8Array(this.wasm_memory.buffer, 280, 448 - 280).slice();
+    state[100] = new Uint8Array(this.wasm_memory.buffer, 456, 8).slice();
+
     return state;
 };
 
@@ -887,6 +893,12 @@ CPU.prototype.set_state = function(state)
     const bitmap = new Bitmap(state[78].buffer);
     const packed_memory = state[77];
     this.unpack_memory(bitmap, packed_memory);
+
+    if(state[99])
+    {
+        new Uint8Array(this.wasm_memory.buffer, 280, 448 - 280).set(state[99]);
+        new Uint8Array(this.wasm_memory.buffer, 456, 8).set(state[100]);
+    }
 
     this.update_state_flags();
 

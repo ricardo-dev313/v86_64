@@ -393,6 +393,8 @@ longmode-tests: build/v86-debug.wasm
 	./tests/longmode/multiboot64.js
 	./tests/longmode/selfipi.js
 	JIT64_CHAINING=0 ./tests/longmode/selfipi.js
+	./tests/longmode/state.js
+	DISABLE_JIT=1 ./tests/longmode/state.js
 
 jitpagingtests: build/v86-debug.wasm
 	$(MAKE) -C tests/jit-paging test-jit test-jit-smc
