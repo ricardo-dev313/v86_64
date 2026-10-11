@@ -1292,6 +1292,14 @@ pub fn set_tlb_code(
     };
     c.state_flags = state_flags;
     c.wasm_table_index = wasm_table_index;
+    if virt_page >= 0x10_0000 {
+        // the copies that module chaining reads (the slot holds this page: see tlb_code_slot)
+        unsafe {
+            let slot = &mut *std::ptr::addr_of_mut!(cpu::tlb_high[cpu::tlb_high_index(virt_page)]);
+            slot.code_state_flags = state_flags.to_u32() as u8;
+            slot.code_wasm_table_index = wasm_table_index.to_u16();
+        }
+    }
 
     // Empty the table. This runs for every code page that enters the tlb, that is for all the
     // code a process touches after each change of address space: undo the entry points of

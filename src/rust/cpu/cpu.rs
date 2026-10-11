@@ -397,7 +397,7 @@ pub fn tlb_entry_to_u64(e: TlbEntry) -> u64 { e as u32 as u64 }
 pub fn tlb_entry_to_u64(e: TlbEntry) -> u64 { e as u64 }
 
 /// Free list of Code allocations. Codes live in dedicated chunks that are never moved, so
-/// the pointers in tlb_code / tlb_code_high (and in generated code) stay valid until freed.
+/// the pointers in tlb_code / tlb_high (and in generated code) stay valid until freed.
 /// Freed Codes are only pushed to this list, which keeps full tlb clears free of allocator
 /// traffic (they free one entry per compiled page).
 static mut code_free_list: Vec<ptr::NonNull<Code>> = Vec::new();
@@ -437,23 +437,48 @@ pub static mut tlb_code: [Option<ptr::NonNull<Code>>; 0x100000] = [None; 0x10000
 // TLB for linear pages at or above 4 GiB (48-bit virtual addresses in long
 // mode). Direct-mapped, keyed by the tag of the page (tlb_high_tag: the page
 // number of the canonical, sign-extended address); an entry is valid if
-// tlb_high_page[idx] == tlb_high_tag(page) and tlb_high_entry[idx] != 0. The entry format is
+// tlb_high[idx].page == tlb_high_tag(page) and tlb_high[idx].entry != 0. The entry format is
 // the same as in tlb_data, but as u64 (the page number << 12 may exceed 32
 // bits): memory::tlb_host_base(phys) ^ (page << 12) | info_bits, so the
 // physical address is reconstructed by phys_of_tlb_entry.
+//
+// Everything about a page sits in one slot of half a host cache line, and neighbouring pages
+// in neighbouring slots (tlb_high_hash): a data access or the search for the next module
+// then costs one line, shared by two consecutive pages. Separate arrays indexed by a
+// scrambling hash cost a line each, and the lookups of the pages a guest touches in a
+// scheduler pass don't fit in the host's first-level cache.
 pub const TLB_HIGH_SIZE: usize = 0x40000;
-pub static mut tlb_high_page: [u64; TLB_HIGH_SIZE] = [0; TLB_HIGH_SIZE];
-pub static mut tlb_high_entry: [u64; TLB_HIGH_SIZE] = [0; TLB_HIGH_SIZE];
-// jitted code for the page in tlb_high_page[idx] (the counterpart of tlb_code
-// for pages at or above 4 GiB); dropped whenever the slot is evicted
-pub static mut tlb_code_high: [Option<ptr::NonNull<Code>>; TLB_HIGH_SIZE] = [None; TLB_HIGH_SIZE];
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TlbHighSlot {
+    pub page: u64,
+    pub entry: u64,
+    /// jitted code for the page (the counterpart of tlb_code for pages at or above 4 GiB);
+    /// dropped whenever the slot is evicted
+    pub code: Option<ptr::NonNull<Code>>,
+    /// copies of code's wasm_table_index and state_flags (set_tlb_code), for the module
+    /// chaining of the jit: it then only reads the Code for the entry point itself
+    pub code_wasm_table_index: u16,
+    pub code_state_flags: u8,
+    _unused: [u8; 13 - std::mem::size_of::<usize>()],
+}
+const _: () = assert!(std::mem::size_of::<TlbHighSlot>() == 1 << TLB_HIGH_SLOT_SHIFT);
+pub const TLB_HIGH_SLOT_SHIFT: u32 = 5;
+pub static mut tlb_high: [TlbHighSlot; TLB_HIGH_SIZE] = [TlbHighSlot {
+    page: 0,
+    entry: 0,
+    code: None,
+    code_wasm_table_index: 0,
+    code_state_flags: 0,
+    _unused: [0; 13 - std::mem::size_of::<usize>()],
+}; TLB_HIGH_SIZE];
 
 /// Remove the high TLB entry at idx, including its jitted code
 #[inline]
 pub unsafe fn tlb_high_evict(idx: usize) {
-    tlb_high_page[idx] = 0;
-    tlb_high_entry[idx] = 0;
-    if let Some(c) = tlb_code_high[idx].take() {
+    tlb_high[idx].page = 0;
+    tlb_high[idx].entry = 0;
+    if let Some(c) = tlb_high[idx].code.take() {
         code_free(c);
     }
 }
@@ -467,8 +492,8 @@ pub unsafe fn tlb_code_slot(page: u64) -> Option<&'static mut Option<ptr::NonNul
     }
     else {
         let idx = tlb_high_index(page);
-        if tlb_high_page[idx] == tlb_high_tag(page) {
-            Some(&mut *ptr::addr_of_mut!(tlb_code_high[idx]))
+        if tlb_high[idx].page == tlb_high_tag(page) {
+            Some(&mut *ptr::addr_of_mut!(tlb_high[idx].code))
         }
         else {
             None
@@ -493,18 +518,23 @@ pub fn canonicalize_address(address: u64) -> u64 { address & 0x0000_FFFF_FFFF_FF
 #[inline]
 pub fn is_canonical_address(address: u64) -> bool { (address << 16) as i64 >> 16 == address as i64 }
 
-/// The tag of a (48-bit) page number in tlb_high_page: the page number of the canonical
+/// The tag of a (48-bit) page number in tlb_high: the page number of the canonical
 /// address, i.e. sign-extended from bit 35. A memory access looks up its address' arithmetic
 /// page number (address as i64 >> 12) directly, which is a tag only for canonical addresses:
 /// non-canonical ones miss and reach do_page_walk, which raises #GP.
 #[inline]
 pub fn tlb_high_tag(page: u64) -> u64 { ((page << 28) as i64 >> 28) as u64 }
 
-/// The slot of a tag in the high TLB (replicated by the jit, see jit64::gen_tlb_high_entry)
+/// The slot of a tag in the high TLB (replicated by the jit, see jit64::gen_tlb_high_slot):
+/// the low bits of the page number, so that consecutive pages get consecutive slots, with
+/// the higher bits folded in so that the regions of an address space (which often start at
+/// multiples of a large power of two) don't all compete for the same slots
 #[inline]
 pub fn tlb_high_hash(tag: u64) -> usize {
-    (tag.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 25) as usize & (TLB_HIGH_SIZE - 1)
+    (tag ^ tag >> TLB_HIGH_FOLD_1 ^ tag >> TLB_HIGH_FOLD_2) as usize & (TLB_HIGH_SIZE - 1)
 }
+pub const TLB_HIGH_FOLD_1: u32 = 18;
+pub const TLB_HIGH_FOLD_2: u32 = 31;
 
 #[inline]
 pub fn tlb_high_index(page: u64) -> usize { tlb_high_hash(tlb_high_tag(page)) }
@@ -521,8 +551,8 @@ pub unsafe fn tlb_pick_entry(address: u64) -> u64 {
     }
     else {
         let idx = tlb_high_index(page);
-        if tlb_high_page[idx] == tlb_high_tag(page) {
-            tlb_high_entry[idx]
+        if tlb_high[idx].page == tlb_high_tag(page) {
+            tlb_high[idx].entry
         }
         else {
             0
@@ -540,8 +570,8 @@ pub unsafe fn tlb_pick_entry_for_access(address: u64) -> u64 {
     else {
         let tag = (address as i64 >> 12) as u64;
         let idx = tlb_high_hash(tag);
-        if tlb_high_page[idx] == tag {
-            tlb_high_entry[idx]
+        if tlb_high[idx].page == tag {
+            tlb_high[idx].entry
         }
         else {
             0
@@ -565,11 +595,11 @@ pub unsafe fn tlb_put_entry(address: u64, tlb_entry: u64) {
     }
     else {
         let idx = tlb_high_index(page);
-        if tlb_high_page[idx] != tlb_high_tag(page) {
+        if tlb_high[idx].page != tlb_high_tag(page) {
             tlb_high_evict(idx);
         }
-        tlb_high_page[idx] = tlb_high_tag(page);
-        tlb_high_entry[idx] = tlb_entry;
+        tlb_high[idx].page = tlb_high_tag(page);
+        tlb_high[idx].entry = tlb_entry;
     }
 }
 
@@ -584,7 +614,7 @@ pub unsafe fn tlb_invalidate_page(address: u64) {
     }
     else {
         let idx = tlb_high_index(page);
-        if tlb_high_page[idx] == tlb_high_tag(page) {
+        if tlb_high[idx].page == tlb_high_tag(page) {
             tlb_high_evict(idx);
         }
     }
@@ -3403,7 +3433,7 @@ pub unsafe fn full_clear_tlb() {
         }
         else {
             let idx = tlb_high_index(page);
-            if tlb_high_page[idx] == tlb_high_tag(page) {
+            if tlb_high[idx].page == tlb_high_tag(page) {
                 tlb_high_evict(idx);
             }
         }
@@ -3435,8 +3465,8 @@ pub unsafe fn clear_tlb() {
         }
         else {
             let idx = tlb_high_index(page);
-            if tlb_high_page[idx] == tlb_high_tag(page) {
-                tlb_high_entry[idx] as i32
+            if tlb_high[idx].page == tlb_high_tag(page) {
+                tlb_high[idx].entry as i32
             }
             else {
                 0
@@ -3453,7 +3483,7 @@ pub unsafe fn clear_tlb() {
         }
         else {
             let idx = tlb_high_index(page);
-            if tlb_high_page[idx] == tlb_high_tag(page) {
+            if tlb_high[idx].page == tlb_high_tag(page) {
                 tlb_high_evict(idx);
             }
         }

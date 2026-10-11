@@ -1869,12 +1869,18 @@ pub fn gen_chain_to_next_module(ctx: &mut JitContext, reenter_label: Label) {
         codegen::gen_get_eip64(ctx.builder);
         let eip = ctx.builder.set_new_local_i64();
 
-        // code = tlb_code_get(canonicalize(eip) >> 12), a pointer to the page's Code or 0
+        // code = tlb_code_get(canonicalize(eip) >> 12), a pointer to the page's Code or 0,
+        // with its state flags and the table index of its module
+        let code = ctx.builder.new_local();
+        let code_flags = ctx.builder.new_local();
+        let code_module = ctx.builder.new_local();
         ctx.builder.get_local_i64(&eip);
         ctx.builder.const_i64(32);
         ctx.builder.shr_u_i64();
         ctx.builder.eqz_i64();
-        ctx.builder.if_i32();
+        // as in gen_tlb_entry: 64-bit code mostly runs above 4 GiB
+        ctx.builder.hint_next_branch(false);
+        ctx.builder.if_void();
         {
             ctx.builder.get_local_i64(&eip);
             ctx.builder.wrap_i64_to_i32();
@@ -1884,43 +1890,56 @@ pub fn gen_chain_to_next_module(ctx: &mut JitContext, reenter_label: Label) {
             ctx.builder.shl_i32();
             ctx.builder
                 .load_aligned_i32(&raw const cpu::tlb_code as u32);
+            ctx.builder.tee_local(&code);
+            // (these read low memory when there is no code, which is checked below)
+            ctx.builder.load_u8(offset_of!(Code, state_flags) as u32);
+            ctx.builder.set_local(&code_flags);
+            ctx.builder.get_local(&code);
+            ctx.builder
+                .load_aligned_u16(offset_of!(Code, wasm_table_index) as u32);
+            ctx.builder.set_local(&code_module);
         }
         ctx.builder.else_();
         {
-            // eip is canonical, so its arithmetic page number is the tag (cpu::tlb_high_tag)
+            // eip is canonical, so its arithmetic page number is the tag (cpu::tlb_high_tag).
+            // The slot of the page has all three, in one cache line of the host.
             ctx.builder.get_local_i64(&eip);
             ctx.builder.const_i64(12);
             ctx.builder.shr_s_i64();
-            let page = ctx.builder.tee_new_local_i64();
-            // slot index: tlb_high_hash(tag)
-            ctx.builder.const_i64(0x9E37_79B9_7F4A_7C15u64 as i64);
-            ctx.builder.mul_i64();
-            ctx.builder.const_i64(25);
-            ctx.builder.shr_u_i64();
-            ctx.builder.wrap_i64_to_i32();
-            ctx.builder.const_i32((TLB_HIGH_SIZE - 1) as i32);
-            ctx.builder.and_i32();
+            let page = ctx.builder.set_new_local_i64();
+            gen_tlb_high_slot(ctx, &page);
+            ctx.builder.const_i32(cpu::TLB_HIGH_SLOT_SHIFT as i32);
+            ctx.builder.shl_i32();
             let slot = ctx.builder.set_new_local();
 
             ctx.builder.get_local(&slot);
-            ctx.builder.const_i32(2);
-            ctx.builder.shl_i32();
-            ctx.builder
-                .load_aligned_i32(&raw const cpu::tlb_code_high as u32);
+            ctx.builder.load_aligned_i32(
+                &raw const cpu::tlb_high as u32 + offset_of!(cpu::TlbHighSlot, code) as u32,
+            );
             ctx.builder.const_i32(0);
             ctx.builder.get_local(&slot);
-            ctx.builder.const_i32(3);
-            ctx.builder.shl_i32();
             ctx.builder
-                .load_aligned_i64(&raw const cpu::tlb_high_page as u32);
+                .load_aligned_i64(&raw const cpu::tlb_high as u32 + TLB_HIGH_SLOT_PAGE);
             ctx.builder.get_local_i64(&page);
             ctx.builder.eq_i64();
             ctx.builder.select();
+            ctx.builder.set_local(&code);
+            ctx.builder.get_local(&slot);
+            ctx.builder.load_u8(
+                &raw const cpu::tlb_high as u32
+                    + offset_of!(cpu::TlbHighSlot, code_state_flags) as u32,
+            );
+            ctx.builder.set_local(&code_flags);
+            ctx.builder.get_local(&slot);
+            ctx.builder.load_aligned_u16(
+                &raw const cpu::tlb_high as u32
+                    + offset_of!(cpu::TlbHighSlot, code_wasm_table_index) as u32,
+            );
+            ctx.builder.set_local(&code_module);
             ctx.builder.free_local(slot);
             ctx.builder.free_local_i64(page);
         }
         ctx.builder.block_end();
-        let code = ctx.builder.tee_new_local();
 
         // code != 0 && code.state_flags == *state_flags && code.state_flags.is_64
         //
@@ -1930,11 +1949,10 @@ pub fn gen_chain_to_next_module(ctx: &mut JitContext, reenter_label: Label) {
         // matching (compat) state flags holds a 32-bit module — the tail call
         // below uses the jit64 signature and would trap with a signature
         // mismatch. Without a chain the main loop dispatches it correctly.
+        ctx.builder.get_local(&code);
         ctx.builder.if_void_likely();
         {
-            ctx.builder.get_local(&code);
-            ctx.builder.load_u8(offset_of!(Code, state_flags) as u32);
-            let code_flags = ctx.builder.tee_new_local();
+            ctx.builder.get_local(&code_flags);
             ctx.builder
                 .load_fixed_u8(global_pointers::state_flags as u32);
             ctx.builder.eq_i32();
@@ -1945,7 +1963,6 @@ pub fn gen_chain_to_next_module(ctx: &mut JitContext, reenter_label: Label) {
             ctx.builder.eqz_i32();
             ctx.builder.eqz_i32();
             ctx.builder.and_i32();
-            ctx.builder.free_local(code_flags);
             ctx.builder.if_void_likely();
             {
                 // state = code.state_table[eip & 0xFFF]
@@ -1965,9 +1982,7 @@ pub fn gen_chain_to_next_module(ctx: &mut JitContext, reenter_label: Label) {
                 ctx.builder.if_void_likely();
                 {
                     // in this module?
-                    ctx.builder.get_local(&code);
-                    ctx.builder
-                        .load_aligned_u16(offset_of!(Code, wasm_table_index) as u32);
+                    ctx.builder.get_local(&code_module);
                     ctx.builder.const_i32(ctx.wasm_table_index.to_u16() as i32);
                     ctx.builder.eq_i32();
                     ctx.builder.if_void();
@@ -1990,9 +2005,7 @@ pub fn gen_chain_to_next_module(ctx: &mut JitContext, reenter_label: Label) {
                     for r in 0..16 {
                         ctx.builder.get_local_i64(&reg_local(ctx, r));
                     }
-                    ctx.builder.get_local(&code);
-                    ctx.builder
-                        .load_aligned_u16(offset_of!(Code, wasm_table_index) as u32);
+                    ctx.builder.get_local(&code_module);
                     ctx.builder.const_i32(WASM_TABLE_OFFSET as i32);
                     ctx.builder.add_i32();
                     ctx.builder.return_call_indirect_jit64();
@@ -2004,6 +2017,8 @@ pub fn gen_chain_to_next_module(ctx: &mut JitContext, reenter_label: Label) {
         }
         ctx.builder.block_end();
         ctx.builder.free_local(code);
+        ctx.builder.free_local(code_flags);
+        ctx.builder.free_local(code_module);
         ctx.builder.free_local_i64(eip);
     }
     ctx.builder.block_end();
@@ -2304,7 +2319,26 @@ fn gen_tlb_entry(ctx: &mut JitContext, address: &WasmLocalI64) {
     }
 }
 
-/// Push the low 32 bits of the hashed tlb's entry for the page of a 64-bit address, or 0 (not
+const TLB_HIGH_SLOT_PAGE: u32 = std::mem::offset_of!(cpu::TlbHighSlot, page) as u32;
+const TLB_HIGH_SLOT_ENTRY: u32 = std::mem::offset_of!(cpu::TlbHighSlot, entry) as u32;
+
+/// Push the index of the slot of a tag in the high tlb (cpu::tlb_high_hash)
+fn gen_tlb_high_slot(ctx: &mut JitContext, page: &WasmLocalI64) {
+    ctx.builder.get_local_i64(page);
+    ctx.builder.get_local_i64(page);
+    ctx.builder.const_i64(cpu::TLB_HIGH_FOLD_1 as i64);
+    ctx.builder.shr_u_i64();
+    ctx.builder.xor_i64();
+    ctx.builder.get_local_i64(page);
+    ctx.builder.const_i64(cpu::TLB_HIGH_FOLD_2 as i64);
+    ctx.builder.shr_u_i64();
+    ctx.builder.xor_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32((TLB_HIGH_SIZE - 1) as i32);
+    ctx.builder.and_i32();
+}
+
+/// Push the low 32 bits of the high tlb's entry for the page of a 64-bit address, or 0 (not
 /// valid) if the slot holds a different page
 fn gen_tlb_high_entry(ctx: &mut JitContext, address: &WasmLocalI64) {
     // tag = address >> 12 (arithmetic): equals cpu::tlb_high_tag of the page for canonical
@@ -2312,21 +2346,17 @@ fn gen_tlb_high_entry(ctx: &mut JitContext, address: &WasmLocalI64) {
     ctx.builder.get_local_i64(address);
     ctx.builder.const_i64(12);
     ctx.builder.shr_s_i64();
-    let page = ctx.builder.tee_new_local_i64();
+    let page = ctx.builder.set_new_local_i64();
 
-    // byte offset of the slot: tlb_high_hash(tag) * 8
-    ctx.builder.const_i64(0x9E37_79B9_7F4A_7C15u64 as i64);
-    ctx.builder.mul_i64();
-    ctx.builder.const_i64(25 - 3);
-    ctx.builder.shr_u_i64();
-    ctx.builder.wrap_i64_to_i32();
-    ctx.builder.const_i32(((TLB_HIGH_SIZE - 1) << 3) as i32);
-    ctx.builder.and_i32();
+    // byte offset of the slot
+    gen_tlb_high_slot(ctx, &page);
+    ctx.builder.const_i32(cpu::TLB_HIGH_SLOT_SHIFT as i32);
+    ctx.builder.shl_i32();
     let slot = ctx.builder.set_new_local();
 
     ctx.builder.get_local(&slot);
     ctx.builder
-        .load_aligned_i64(&raw const cpu::tlb_high_entry as u32);
+        .load_aligned_i64(&raw const cpu::tlb_high as u32 + TLB_HIGH_SLOT_ENTRY);
     if cfg!(feature = "mem64") {
         ctx.builder.const_i64(0);
     }
@@ -2336,7 +2366,7 @@ fn gen_tlb_high_entry(ctx: &mut JitContext, address: &WasmLocalI64) {
     }
     ctx.builder.get_local(&slot);
     ctx.builder
-        .load_aligned_i64(&raw const cpu::tlb_high_page as u32);
+        .load_aligned_i64(&raw const cpu::tlb_high as u32 + TLB_HIGH_SLOT_PAGE);
     ctx.builder.get_local_i64(&page);
     ctx.builder.eq_i64();
     ctx.builder.select();
